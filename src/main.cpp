@@ -204,6 +204,23 @@ bool init()
 {
     glfwSetErrorCallback(errorCallback);
 
+#if defined(__linux__)
+    // GLEW uses the GLX OpenGL loader on Linux, so request GLFW's X11
+    // backend when running in a Wayland session (through XWayland).  The
+    // bundled GLFW 3.3 header predates these names, while Gentoo links GLFW
+    // 3.4, so use the GLFW 3.4 values directly.
+    int glfwMajor = 0;
+    int glfwMinor = 0;
+    int glfwRevision = 0;
+    glfwGetVersion(&glfwMajor, &glfwMinor, &glfwRevision);
+    if (glfwMajor > 3 || (glfwMajor == 3 && glfwMinor >= 4))
+    {
+        constexpr int glfwPlatformHint = 0x00050003;
+        constexpr int glfwPlatformX11 = 0x00060004;
+        glfwInitHint(glfwPlatformHint, glfwPlatformX11);
+    }
+#endif
+
     if (!glfwInit())
     {
         exit(EXIT_FAILURE);
@@ -222,8 +239,10 @@ bool init()
 
     // Set up GL context
     glewExperimental = GL_TRUE;
-    if (glewInit() != GLEW_OK)
+    GLenum glewError = glewInit();
+    if (glewError != GLEW_OK)
     {
+        fprintf(stderr, "Failed to initialize GLEW: %s\n", glewGetErrorString(glewError));
         return false;
     }
     printf("Opengl Version:%s\n", glGetString(GL_VERSION));
@@ -380,7 +399,11 @@ int main(int argc, char** argv)
     zoom = glm::length(cam.position - ogLookAt);
 
     // Initialize CUDA and GL components
-    init();
+    if (!init())
+    {
+        fprintf(stderr, "Failed to initialize the graphics runtime.\n");
+        return EXIT_FAILURE;
+    }
 
     // Initialize ImGui Data
     InitImguiData(guiData);

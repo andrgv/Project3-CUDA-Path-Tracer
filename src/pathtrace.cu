@@ -6,6 +6,9 @@
 #include <thrust/execution_policy.h>
 #include <thrust/random.h>
 #include <thrust/remove.h>
+#include <thrust/partition.h>
+#include <thrust/sort.h>
+
 
 #include "sceneStructs.h"
 #include "scene.h"
@@ -16,6 +19,7 @@
 #include "interactions.h"
 
 #define ERRORCHECK 1
+#define CONTIGUOUS_BY_MATERIAL 1
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -41,6 +45,21 @@ void checkCUDAErrorFn(const char* msg, const char* file, int line)
     exit(EXIT_FAILURE);
 #endif // ERRORCHECK
 }
+
+// predicate for thrust partition
+struct hasBouncesRemaining {
+    __host__ __device__ bool operator()(const PathSegment &path) const {
+        return path.remainingBounces > 0;
+    }
+};
+
+struct compareMaterial {
+    __host__ __device__ bool operator()(
+        const ShadeableIntersection &a,
+        const ShadeableIntersection &b) const {
+            return a.materialId < b.materialId;
+        }
+};
 
 __host__ __device__
 thrust::default_random_engine makeSeededRandomEngine(int iter, int index, int depth)
@@ -146,10 +165,15 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         segment.ray.origin = cam.position;
         segment.color = glm::vec3(1.0f, 1.0f, 1.0f);
 
-        // TODO: implement antialiasing by jittering the ray
+        // implement antialiasing by jittering the ray
+        thrust::default_random_engine rng = makeSeededRandomEngine(iter, index, 0);
+        thrust::uniform_real_distribution<float> u01(0, 1);
+        float jitter_x = u01(rng) - 0.5;
+        float jitter_y = u01(rng) - 0.5;
+
         segment.ray.direction = glm::normalize(cam.view
-            - cam.right * cam.pixelLength.x * ((float)x - (float)cam.resolution.x * 0.5f)
-            - cam.up * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f)
+            - cam.right * cam.pixelLength.x * ((float)x + jitter_x - (float)cam.resolution.x * 0.5f)
+            - cam.up * cam.pixelLength.y * ((float)y + jitter_y - (float)cam.resolution.y * 0.5f)
         );
 
         segment.pixelIndex = index;
@@ -280,6 +304,58 @@ __global__ void shadeFakeMaterial(
     }
 }
 
+__global__ void shadeMaterial(
+    int iter,
+    int num_paths,
+    int depth,
+    ShadeableIntersection* shadeableIntersections,
+    PathSegment* pathSegments,
+    Material* materials
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_paths)
+    {
+        PathSegment &path = pathSegments[idx];
+        if (path.remainingBounces <= 0) {
+            return;
+        }
+
+        ShadeableIntersection intersection = shadeableIntersections[idx];
+        if (intersection.t > 0.0f) // if the intersection exists...
+        {
+          // Set up the RNG
+          // LOOK: this is how you use thrust's RNG! Please look at
+          // makeSeededRandomEngine as well.
+            thrust::default_random_engine rng = makeSeededRandomEngine(iter, path.pixelIndex, depth);
+
+            Material material = materials[intersection.materialId];
+            glm::vec3 materialColor = material.color;
+
+            // If the material indicates that the object was a light, "light" the ray
+            if (material.emittance > 0.0f) {
+                pathSegments[idx].color *= (materialColor * material.emittance);
+                path.remainingBounces = 0;
+            }
+            else {
+                glm::vec3 intersect = pathSegments[idx].ray.origin + intersection.t * pathSegments[idx].ray.direction;
+                scatterRay(path, intersect, intersection.surfaceNormal, material, rng);
+                pathSegments[idx].remainingBounces--;
+                if (path.remainingBounces == 0) {
+                    path.color = glm::vec3(0);
+                }
+            }
+            // If there was no intersection, color the ray black.
+            // Lots of renderers use 4 channel color, RGBA, where A = alpha, often
+            // used for opacity, in which case they can indicate "no opacity".
+            // This can be useful for post-processing and image compositing.
+        }
+        else {
+            pathSegments[idx].color = glm::vec3(0.0f);
+            pathSegments[idx].remainingBounces = 0;
+        }
+    }
+}
+
 // Add the current iteration's output to the overall image
 __global__ void finalGather(int nPaths, glm::vec3* image, PathSegment* iterationPaths)
 {
@@ -380,15 +456,25 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         // materials you have in the scenefile.
         // TODO: compare between directly shading the path segments and shading
         // path segments that have been reshuffled to be contiguous in memory.
+        #if CONTIGUOUS_BY_MATERIAL
+        thrust::sort_by_key(
+            thrust::device, dev_intersections, 
+            dev_intersections + num_paths, dev_paths, 
+            compareMaterial());
+        #endif
 
-        shadeFakeMaterial<<<numblocksPathSegmentTracing, blockSize1d>>>(
+        shadeMaterial<<<numblocksPathSegmentTracing, blockSize1d>>>(
             iter,
             num_paths,
+            depth,
             dev_intersections,
             dev_paths,
             dev_materials
         );
-        iterationComplete = true; // TODO: should be based off stream compaction results.
+        
+        PathSegment* activeEnd = thrust::partition(thrust::device, dev_paths, dev_paths + num_paths, hasBouncesRemaining());
+        num_paths = (int)(activeEnd - dev_paths);
+        iterationComplete = !num_paths || depth >= traceDepth; // based off stream compaction results.
 
         if (guiData != NULL)
         {
@@ -398,7 +484,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 
     // Assemble this iteration and apply it to the image
     dim3 numBlocksPixels = (pixelcount + blockSize1d - 1) / blockSize1d;
-    finalGather<<<numBlocksPixels, blockSize1d>>>(num_paths, dev_image, dev_paths);
+    finalGather<<<numBlocksPixels, blockSize1d>>>(pixelcount, dev_image, dev_paths);
 
     ///////////////////////////////////////////////////////////////////////////
 
