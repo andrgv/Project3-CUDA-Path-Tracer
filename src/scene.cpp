@@ -246,10 +246,17 @@ void Scene::loadFromGLTF(const std::string& gltfName) {
 void Scene::loadFromOBJ(const std::string& objName){
     tinyobj::attrib_t attrib;
     std::vector<tinyobj::shape_t> shapes;
-    std::vector<tinyobj::material_t> materials;
+    std::vector<tinyobj::material_t> objMaterials;
     std::string warn;
     std::string err;
-    bool loaded = LoadObj(&attrib, &shapes, &materials, &warn, &err, objName.c_str());
+
+    std::filesystem::path objPath(objName);
+    std::string baseDirectory = objPath.parent_path().string() 
+        + std::filesystem::path::preferred_separator;
+    
+    bool loaded = LoadObj(
+        &attrib, &shapes, &objMaterials, &warn, &err, 
+        objName.c_str(), baseDirectory.c_str());
 
     if (!warn.empty()) {
         std::cerr << "Warning: " << warn << std::endl;
@@ -270,6 +277,40 @@ void Scene::loadFromOBJ(const std::string& objName){
 
     this->materials.push_back(defaultMaterial);
 
+    // should be 1
+    const int objMaterialOffset = this->materials.size();
+
+    // actually set the right material
+    for (const tinyobj::material_t &objMaterial : objMaterials) {
+        Material material{};
+
+        const glm::vec3 diffuse(
+            objMaterial.diffuse[0],
+            objMaterial.diffuse[1],
+            objMaterial.diffuse[2]
+        );
+
+        const glm::vec3 emission(
+            objMaterial.emission[0],
+            objMaterial.emission[1],
+            objMaterial.emission[2]
+        );
+
+        material.emittance = glm::max(
+            emission.x, glm::max(emission.y, emission.z)
+        );
+
+        // for emissixe materials, color is normalized emission color
+        // o.w. storing diffuse color
+        if (material.emittance > 0) {
+            material.color = emission / material.emittance;
+        } else {
+            material.color = diffuse;
+        }
+        this->materials.push_back(material);
+    }
+    
+
     for (const tinyobj::shape_t &s : shapes) {
         for (const tinyobj::index_t &i : s.mesh.indices) {
             mesh.indices.push_back(
@@ -278,18 +319,26 @@ void Scene::loadFromOBJ(const std::string& objName){
         }
 
         mesh.num_face_vertices.insert(
-                mesh.num_face_vertices.end(), 
-                s.mesh.num_face_vertices.begin(),
-                s.mesh.num_face_vertices.end());
+            mesh.num_face_vertices.end(), 
+            s.mesh.num_face_vertices.begin(),
+            s.mesh.num_face_vertices.end()
+        );
             
         for (size_t face = 0; face < s.mesh.num_face_vertices.size(); ++face) {
-            mesh.material_ids.push_back(defaultMaterialId);
+            const int objMaterialId = face < s.mesh.material_ids.size() ? s.mesh.material_ids[face] : -1;
+
+            if (objMaterialId >= 0 && objMaterialId < objMaterials.size()) {
+                mesh.material_ids.push_back(objMaterialOffset + objMaterialId);
+            } else {
+                mesh.material_ids.push_back(defaultMaterialId);
+            }
         }
 
         mesh.smoothing_group_ids.insert(
             mesh.smoothing_group_ids.end(),
             s.mesh.smoothing_group_ids.begin(),
-            s.mesh.smoothing_group_ids.end());
+            s.mesh.smoothing_group_ids.end()
+        );
     }
 
     

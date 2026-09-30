@@ -54,6 +54,8 @@ GLuint texcoordsLocation = 1;
 GLuint pbo;
 GLuint displayImage;
 
+cudaGraphicsResource* cudaPboResource = nullptr;
+
 GLFWwindow* window;
 GuiDataContainer* imguiData = NULL;
 ImGuiIO* io = nullptr;
@@ -142,7 +144,11 @@ void deletePBO(GLuint* pbo)
     if (pbo)
     {
         // unregister this buffer object with CUDA
-        cudaGLUnregisterBufferObject(*pbo);
+        // cudaGLUnregisterBufferObject(*pbo);
+        if (cudaPboResource != nullptr) {
+            cudaGraphicsUnregisterResource(cudaPboResource);
+            cudaPboResource = nullptr;
+        }
 
         glBindBuffer(GL_ARRAY_BUFFER, *pbo);
         glDeleteBuffers(1, pbo);
@@ -171,9 +177,40 @@ void cleanupCuda()
 
 void initCuda()
 {
-    cudaGLSetGLDevice(0);
+    // apparently deprecated according to cuda docs
+    // cudaGLSetGLDevice(0);
 
     // Clean up on program exit
+    // atexit(cleanupCuda);
+
+    int cudaDeviceCount = 0;
+    cudaError_t error = cudaGetDeviceCount(&cudaDeviceCount);
+
+    std::cerr << "cudaGetDeviceCount: "
+              << cudaGetErrorString(error)
+              << ", count=" << cudaDeviceCount << '\n';
+
+    unsigned int glDeviceCount = 0;
+    int glDevices[8]{};
+
+    error = cudaGLGetDevices(
+        &glDeviceCount,
+        glDevices,
+        8,
+        cudaGLDeviceListAll
+    );
+
+    std::cerr << "cudaGLGetDevices: "
+              << cudaGetErrorString(error)
+              << ", count=" << glDeviceCount << '\n';
+
+    if (error == cudaSuccess && glDeviceCount > 0) {
+        error = cudaSetDevice(glDevices[0]);
+
+        std::cerr << "cudaSetDevice(" << glDevices[0] << "): "
+                  << cudaGetErrorString(error) << '\n';
+    }
+
     atexit(cleanupCuda);
 }
 
@@ -192,7 +229,13 @@ void initPBO()
 
     // Allocate data for the buffer. 4-channel 8-bit image
     glBufferData(GL_PIXEL_UNPACK_BUFFER, size_tex_data, NULL, GL_DYNAMIC_COPY);
-    cudaGLRegisterBufferObject(pbo);
+    // cudaError_t error = cudaGLRegisterBufferObject(pbo);
+    cudaError_t error = cudaGraphicsGLRegisterBuffer(
+        &cudaPboResource, pbo, cudaGraphicsRegisterFlagsWriteDiscard);
+    if (error != cudaSuccess) {
+        std::cerr << "cudaGraphicsGLRegisterBuffer: " << cudaGetErrorString(error) << '\n';
+        std::exit(EXIT_FAILURE);
+    }
 }
 
 void errorCallback(int error, const char* description)
@@ -469,22 +512,38 @@ void runCuda()
 
     if (iteration == 0)
     {
-        pathtraceFree();
+        // pathtraceFree();
         pathtraceInit(scene);
     }
 
     if (iteration < renderState->iterations)
     {
         uchar4* pbo_dptr = NULL;
+        size_t mappedSize = 0;
         iteration++;
-        cudaGLMapBufferObject((void**)&pbo_dptr, pbo);
+        // cudaGLMapBufferObject((void**)&pbo_dptr, pbo);
+        cudaError_t error = cudaGraphicsMapResources(1, &cudaPboResource, 0);
+        if (error != cudaSuccess) {
+            std::cerr << "cudaGraphicsMapResources: " << cudaGetErrorString(error) << '\n';
+            std::exit(EXIT_FAILURE);
+        }
+
+        error = cudaGraphicsResourceGetMappedPointer(
+            (void**)(&pbo_dptr), &mappedSize, cudaPboResource
+        );
+
+        if (error != cudaSuccess) {
+            std::cerr << "cudaGraphicsResourceGetMappedPointer: " << cudaGetErrorString(error) << '\n';
+            std::exit(EXIT_FAILURE);
+        }
 
         // execute the kernel
         int frame = 0;
         pathtrace(pbo_dptr, frame, iteration);
 
         // unmap buffer object
-        cudaGLUnmapBufferObject(pbo);
+        // cudaGLUnmapBufferObject(pbo);
+        cudaGraphicsUnmapResources(1, &cudaPboResource, 0);
     }
     else
     {
