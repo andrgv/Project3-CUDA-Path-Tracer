@@ -27,6 +27,9 @@
 #define MIS 1
 #define RUSSIAN_ROULETTE 1
 #define HIERARCHICAL_SPATIAL_DS 1
+#define TEXTURE_MAPPING 1
+#define BUMP_MAPPING 1
+#define ENVIRONMENT_LIGHT 1
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -442,12 +445,13 @@ static Geom* dev_geoms = NULL;
 static Material* dev_materials = NULL;
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
-// TODO: static variables for device memory, any extra info you need, etc
+// static variables for device memory, any extra info you need, etc
 static int *dev_light_geom_indices = NULL;
 static int num_lights = 0;
 static LinearBVHNode* dev_bvh_nodes = NULL;
 static int* dev_bvh_geom_indices = NULL;
 static int num_bvh_nodes = 0;
+static uchar4 *dev_tex_pixels = NULL;
 
 static std::vector<LinearBVHNode> hst_bvh_nodes;
 static std::vector<int> hst_bvh_geom_indices;
@@ -494,7 +498,7 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
     cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
 
-    // TODO: initialize any extra device memeory you need
+    // initialize any extra device memeory you need
     // initializing all sources of light for direct lighting and MIS
 
     std::vector<int> lightGeomIndices;
@@ -516,6 +520,12 @@ void pathtraceInit(Scene* scene)
         cudaMemcpy(dev_light_geom_indices, lightGeomIndices.data(), num_lights * sizeof(int), cudaMemcpyHostToDevice);
     }
 
+    if (!scene->texPixels.empty()) {
+        cudaMalloc(&dev_tex_pixels, scene->texPixels.size() * sizeof(uchar4));
+        cudaMemcpy(dev_tex_pixels, scene->texPixels.data(), scene->texPixels.size() * sizeof(uchar4), cudaMemcpyHostToDevice);
+    }
+
+
     checkCUDAError("pathtraceInit");
 }
 
@@ -529,7 +539,7 @@ void pathtraceFree()
     cudaFree(dev_light_geom_indices);
     cudaFree(dev_bvh_geom_indices);
     cudaFree(dev_bvh_nodes);
-    // TODO: clean up any extra device memory you created
+    cudaFree(dev_tex_pixels);
 
     checkCUDAError("pathtraceFree");
 }
@@ -731,6 +741,98 @@ __global__ void shadeFakeMaterial(
     }
 }
 
+
+// helpers for texture mapping
+__device__ int wrapTexCoord(int x, int size) {
+    x %= size;
+    return x >= 0 ? x : x + size;
+}
+
+__device__ glm::vec3 readTexPixel(
+    const uchar4 *pixels, int offset, int width, int height, int x, int y) {
+        x = wrapTexCoord(x, width);
+        y = wrapTexCoord(y, height);
+        uchar4 pixel = pixels[offset + y * width + x];
+        return glm::vec3(pixel.x, pixel.y, pixel.z) / 255.0f;
+}
+
+__device__ glm::vec3 sampleTexture(
+    const uchar4 *pixels, int offset, int width, int height, glm::vec2 st
+) {
+    st.x -= floorf(st.x);
+    st.y -= floorf(st.y);
+    float x = st.x * width - 0.5;
+    float y = st.y * height - 0.5;
+    int x0 = floor(x);
+    int y0 = floor(y);
+    float dx = x - x0;
+    float dy = y - y0;
+
+    glm::vec3 c00 = readTexPixel(pixels, offset, width, height, x0, y0);
+    glm::vec3 c10 = readTexPixel(pixels, offset, width, height, x0 + 1, y0);
+    glm::vec3 c01 = readTexPixel(pixels, offset, width, height, x0, y0 + 1);
+    glm::vec3 c11 = readTexPixel(pixels, offset, width, height, x0 + 1, y0 + 1);
+
+    glm::vec3 c0 = c00 * (1 - dx) + c10 * dx;
+    glm::vec3 c1 = c01 * (1 - dx) + c11 * dx;
+    return c0 * (1 - dy) + c1 * dy;
+}
+
+__device__ glm::vec2 getTriangleUV(const Geom& triangle, const glm::vec3& p) {
+    glm::vec3 a = triangle.triangleVertices[1] - triangle.triangleVertices[0];
+    glm::vec3 b = triangle.triangleVertices[2] - triangle.triangleVertices[0];
+    glm::vec3 pointVec = p - triangle.triangleVertices[0];
+
+    float d00 = glm::dot(a, a);
+    float d01 = glm::dot(a, b);
+    float d11 = glm::dot(b, b);
+    float d20 = glm::dot(pointVec, a);
+    float d21 = glm::dot(pointVec, b);
+    float denom = d00 * d11 - d01 * d01;
+    float b1 = (d11 * d20 - d01 * d21) / denom;
+    float b2 = (d00 * d21 - d01 * d20) / denom;
+    float b0 = 1.0f - b1 - b2;
+
+    return b0 * triangle.triangleUVs[0] + b1 * triangle.triangleUVs[1] + b2 * triangle.triangleUVs[2];
+}
+
+__device__ float sampleHeight(const uchar4* pixels, const Material& material, glm::vec2 st) {
+    glm::vec3 color = sampleTexture(
+        pixels, material.bumpTexOffset, material.bumpTexWidth,
+        material.bumpTexHeight, st);
+
+    return (color.x + color.y + color.z) / 3;
+}
+
+__device__ glm::vec3 bumpNormal(
+    const uchar4* pixels, const Material& material, const Geom& triangle, glm::vec2 st, glm::vec3 normal
+) {
+    glm::vec3 e1 = triangle.triangleVertices[1] - triangle.triangleVertices[0];
+    glm::vec3 e2 = triangle.triangleVertices[2] - triangle.triangleVertices[0];
+    glm::vec2 dst1 = triangle.triangleUVs[1] - triangle.triangleUVs[0];
+    glm::vec2 dst2 = triangle.triangleUVs[2] - triangle.triangleUVs[0];
+
+    float determinant = dst1.x * dst2.y - dst1.y * dst2.x;
+    if (fabsf(determinant) < 0.0000001) {
+        return normal;
+    }
+
+    glm::vec3 dpdu = (dst2.y * e1 - dst1.y * e2) / determinant;
+    glm::vec3 dpdv = (-dst2.x * e1 + dst1.x * e2) / determinant;
+    float du = 1.0f / material.bumpTexWidth;
+    float dv = 1.0f / material.bumpTexHeight;
+    float height = sampleHeight(pixels, material, st);
+    float dHdu = material.bumpStrength * (sampleHeight(pixels, material, st + glm::vec2(du, 0)) - height) / du;
+    float dHdv = material.bumpStrength * (sampleHeight(pixels, material, st + glm::vec2(0, dv)) - height) / dv;
+
+    glm::vec3 bumpedNormal = glm::normalize(glm::cross(dpdu + dHdu * normal, dpdv + dHdv * normal));
+    if (glm::dot(bumpedNormal, normal) < 0) {
+        bumpedNormal = -bumpedNormal;
+    }
+
+    return bumpedNormal;
+}
+
 __host__ __device__ glm::vec3 evaluateProceduralTexture(const Material& material, const glm::vec3& p) {
     if (material.textureType == CHECKER) {
         int checker = floor(2 * p.x) + floor(2 * p.y) + floor(2 * p.z);
@@ -751,6 +853,7 @@ __global__ void shadeMaterial(
     Material* materials,
     Geom* geoms,
     int geoms_size,
+    uchar4 *texPixels,
     int* lightGeomIndices,
     int numLights,
     LinearBVHNode* bvhNodes,
@@ -778,7 +881,31 @@ __global__ void shadeMaterial(
 
             Material material = materials[intersection.materialId];
             glm::vec3 p = path.ray.origin + intersection.t * path.ray.direction;
-            material.color = evaluateProceduralTexture(material, p);
+
+            const Geom &currGeom = geoms[intersection.geomId];
+            bool hasUVs = currGeom.type == TRIANGLE && currGeom.hasUVs;
+            glm::vec2 st = hasUVs ? getTriangleUV(currGeom, p) : glm::vec2(0);
+
+            if (hasUVs && material.colorTexWidth > 0) {
+                #if TEXTURE_MAPPING
+                material.color *= sampleTexture(
+                    texPixels, material.colorTexOffset, material.colorTexWidth, 
+                    material.colorTexHeight, st);
+                #else
+                material.textureType = CHECKER;
+                material.color = evaluateProceduralTexture(material, p);
+                #endif
+            } else {
+                material.color = evaluateProceduralTexture(material, p);
+            }
+
+            #if BUMP_MAPPING
+            if (hasUVs && material.bumpTexWidth > 0) {
+                intersection.surfaceNormal = bumpNormal(
+                    texPixels, material, currGeom, st, intersection.surfaceNormal);
+            }
+            #endif
+            
             glm::vec3 materialColor = material.color;
             
             // If the material indicates that the object was a light, "light" the ray
@@ -859,6 +986,11 @@ __global__ void shadeMaterial(
             // This can be useful for post-processing and image compositing.
         }
         else {
+            // some of the obj and gltf modelsim testing on dont have emmissive materials
+            // so an environment light makes them visible
+            #if ENVIRONMENT_LIGHT
+                path.L += path.color * glm::vec3(0.8);
+            #endif
             pathSegments[idx].remainingBounces = 0;
         }
     }
@@ -983,6 +1115,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_materials,
             dev_geoms,
             hst_scene->geoms.size(),
+            dev_tex_pixels,
             dev_light_geom_indices,
             num_lights,
             dev_bvh_nodes,

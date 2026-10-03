@@ -80,4 +80,5 @@ public:
     std::vector<Geom> geoms;
     std::vector<Material> materials;
     RenderState state;
+    std::vector<uchar4> texPixels;
 };

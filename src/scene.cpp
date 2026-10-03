@@ -15,9 +15,54 @@
 #include <string>
 #include <unordered_map>
 #include <stdexcept>
+#include <filesystem>
+#include <stb_image.h>
 
 using namespace std;
 using json = nlohmann::json;
+
+static glm::ivec3 storeTexture(
+    unsigned char* image, int width, int height, 
+    std::vector<uchar4>& texPixels
+) {
+    if (image == nullptr) {
+        return glm::ivec3(0);
+    }
+
+    int offset = texPixels.size();
+    texPixels.resize(offset + width * height);
+    for (int i = 0; i < width * height; ++i) {
+        texPixels[offset + i] = make_uchar4(
+            image[4 * i],
+            image[4 * i + 1],
+            image[4 * i + 2],
+            image[4 * i + 3]
+        );
+    }
+
+    stbi_image_free(image);
+    return glm::ivec3(offset, width, height);
+}
+
+static glm::ivec3 loadTextureFile(const std::string &filename, std::vector<uchar4> &texPixels) {
+    int w, h, channels;
+    unsigned char *image = stbi_load(filename.c_str(), &w, &h, &channels, 4);
+    if (image == nullptr) {
+        std::cerr << "Error loading texture " << filename << ": " << stbi_failure_reason() << std::endl;
+        return glm::ivec3(0);
+    }
+    return storeTexture(image, w, h, texPixels);
+}
+
+static glm::ivec3 loadTextureMemory(const uint8_t *data, int size, std::vector<uchar4> &texPixels) {
+    int w, h, channels;
+    unsigned char *image = stbi_load_from_memory(data, size, &w, &h, &channels, 4);
+    if (image == nullptr) {
+        std::cerr << "Error loading texture: " << stbi_failure_reason() << std::endl;
+        return glm::ivec3(0);
+    }
+    return storeTexture(image, w, h, texPixels);
+}
 
 Scene::Scene(string filename)
 {
@@ -200,6 +245,31 @@ void Scene::loadFromGLTF(const std::string& gltfName) {
 
     mesh = {};
 
+    // load images embedded into gltf
+    std::vector<glm::ivec3> gltfImages(model.images_count, glm::ivec3(0));
+    std::filesystem::path baseDirectory = std::filesystem::path(gltfName).parent_path();
+
+    for (int i = 0; i < model.images_count; ++i) {
+        const tg3_image& image = model.images[i];
+
+        if (image.buffer_view >= 0) {
+            const tg3_buffer_view& view = model.buffer_views[image.buffer_view];
+            const tg3_buffer& buffer = model.buffers[view.buffer];
+
+            gltfImages[i] = loadTextureMemory(
+                buffer.data.data + view.byte_offset, view.byte_length, texPixels
+            );
+        } else if (image.uri.len > 0) {
+            std::string uri(image.uri.data, image.uri.len);
+
+            if (uri.rfind("data:", 0) == 0) {
+                std::cerr << "Error loading gltf texture" << std::endl;
+            } else {
+                gltfImages[i] = loadTextureFile((baseDirectory / uri).string(), texPixels);
+            }
+        }
+    }
+
     const int default_material_id = materials.size();
     Material default_material{};
     default_material.color = glm::vec3(1);
@@ -223,6 +293,15 @@ void Scene::loadFromGLTF(const std::string& gltfName) {
                 model.materials[i].emissive_factor[2]
             ));
 
+        int texIndex = model.materials[i].pbr_metallic_roughness.base_color_texture.index;
+        if (texIndex >= 0 && texIndex < model.textures_count) {
+            int imageIndex = model.textures[texIndex].source;
+            if (imageIndex >= 0 && imageIndex < gltfImages.size()) {
+                curr_material.colorTexOffset = gltfImages[imageIndex].x;
+                curr_material.colorTexWidth = gltfImages[imageIndex].y;
+                curr_material.colorTexHeight = gltfImages[imageIndex].z;
+            }
+        }
         materials.push_back(curr_material);
     }
 
@@ -307,6 +386,10 @@ void Scene::loadFromOBJ(const std::string& objName){
     mesh.vertices.assign(attrib.vertices.begin(), attrib.vertices.end());
     mesh.normals.assign(attrib.normals.begin(), attrib.normals.end());
     mesh.texcoords.assign(attrib.texcoords.begin(), attrib.texcoords.end());
+    // need to flip obj v coords
+    for (size_t i = 1; i < mesh.texcoords.size(); i += 2) {
+        mesh.texcoords[i] = 1 - mesh.texcoords[i];
+    }
 
     // set default material for obj
     Material defaultMaterial{};
@@ -345,6 +428,24 @@ void Scene::loadFromOBJ(const std::string& objName){
             material.color = emission / material.emittance;
         } else {
             material.color = diffuse;
+        }
+
+        // load textures
+        if (!objMaterial.diffuse_texname.empty()) {
+            std::string filename = (std::filesystem::path(baseDirectory) / objMaterial.diffuse_texname).string();
+            glm::ivec3 texture = loadTextureFile(filename, texPixels);
+            material.colorTexOffset = texture.x;
+            material.colorTexWidth = texture.y;
+            material.colorTexHeight = texture.z;
+        }
+
+        if (!objMaterial.bump_texname.empty()) {
+            std::string filename = (std::filesystem::path(baseDirectory) / objMaterial.bump_texname).string();
+            glm::ivec3 texture = loadTextureFile(filename, texPixels);
+            material.bumpTexOffset = texture.x;
+            material.bumpTexWidth = texture.y;
+            material.bumpTexHeight = texture.z;
+            material.bumpStrength = 0.02f * objMaterial.bump_texopt.bump_multiplier;
         }
         this->materials.push_back(material);
     }
@@ -399,6 +500,7 @@ void Scene::appendMeshToRender() {
         triangle.type = TRIANGLE;
         triangle.materialid = mesh.material_ids[f];
         triangle.hasNormals = true;
+        triangle.hasUVs = true;
 
         for (int j = 0; j < 3; ++j) {
             const index_t &index = mesh.indices[offset + j];
@@ -416,6 +518,15 @@ void Scene::appendMeshToRender() {
                     mesh.normals[3 * index.normal_index],
                     mesh.normals[3 * index.normal_index + 1],
                     mesh.normals[3 * index.normal_index + 2]
+                );
+            }
+
+            if (index.texcoord_index < 0) {
+                triangle.hasUVs = false;
+            } else {
+                triangle.triangleUVs[j] = glm::vec2(
+                    mesh.texcoords[2 * index.texcoord_index],
+                    mesh.texcoords[3 * index.texcoord_index + 1]
                 );
             }
         }

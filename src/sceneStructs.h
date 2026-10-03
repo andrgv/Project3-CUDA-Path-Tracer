@@ -35,6 +35,8 @@ struct Geom
     glm::vec3 triangleVertices[3];
     glm::vec3 triangleNormals[3];
     bool hasNormals;
+    glm::vec2 triangleUVs[3];
+    bool hasUVs;
 };
 
 enum TextureType {
@@ -56,6 +58,15 @@ struct Material
     float indexOfRefraction;
     float emittance;
     TextureType textureType;
+    
+    int colorTexOffset;
+    int colorTexWidth;
+    int colorTexHeight;
+
+    int bumpTexOffset;
+    int bumpTexWidth;
+    int bumpTexHeight;
+    float bumpStrength;
 };
 
 struct Camera
