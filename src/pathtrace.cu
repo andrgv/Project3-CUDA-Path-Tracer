@@ -731,6 +731,17 @@ __global__ void shadeFakeMaterial(
     }
 }
 
+__host__ __device__ glm::vec3 evaluateProceduralTexture(const Material& material, const glm::vec3& p) {
+    if (material.textureType == CHECKER) {
+        int checker = floor(2 * p.x) + floor(2 * p.y) + floor(2 * p.z);
+        return checker % 2 == 0 ? material.color : 0.1f * material.color;
+    } else if (material.textureType == STRIPES) {
+        return sinf(12.0f * p.y) > 0.0f ? material.color : 0.1f * material.color;
+    }
+
+    return material.color;
+}
+
 __global__ void shadeMaterial(
     int iter,
     int num_paths,
@@ -766,9 +777,10 @@ __global__ void shadeMaterial(
             thrust::default_random_engine rng = makeSeededRandomEngine(iter, path.pixelIndex, depth);
 
             Material material = materials[intersection.materialId];
-            glm::vec3 materialColor = material.color;
             glm::vec3 p = path.ray.origin + intersection.t * path.ray.direction;
-
+            material.color = evaluateProceduralTexture(material, p);
+            glm::vec3 materialColor = material.color;
+            
             // If the material indicates that the object was a light, "light" the ray
             if (material.emittance > 0.0f) {
                 const Geom& light = geoms[intersection.geomId];

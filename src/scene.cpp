@@ -74,6 +74,21 @@ void Scene::loadFromJSON(const std::string& jsonName)
             newMaterial.hasRefractive = 1;
             newMaterial.indexOfRefraction = p["IOR"];
         }
+
+        // load texture
+        const std::string texture = p.value("TEXTURE", std::string("Solid"));
+        if (texture == "Checker")
+        {
+            newMaterial.textureType = CHECKER;
+        }
+        else if (texture == "Stripes")
+        {
+            newMaterial.textureType = STRIPES;
+        } else
+        {
+            newMaterial.textureType = SOLID;
+        }
+
         MatNameToID[name] = materials.size();
         materials.emplace_back(newMaterial);
     }
@@ -81,6 +96,25 @@ void Scene::loadFromJSON(const std::string& jsonName)
     for (const auto& p : objectsData)
     {
         const auto& type = p["TYPE"];
+        const auto& trans = p["TRANS"];
+        const auto& rotat = p["ROTAT"];
+        const auto& scale = p["SCALE"];
+        glm::vec3 translation = glm::vec3(trans[0], trans[1], trans[2]);
+        glm::vec3 rotation = glm::vec3(rotat[0], rotat[1], rotat[2]);
+        glm::vec3 geomScale = glm::vec3(scale[0], scale[1], scale[2]);
+        glm::mat4 transform = utilityCore::buildTransformationMatrix(
+            translation, rotation, geomScale);
+        int materialId = MatNameToID[p["MATERIAL"]];
+
+        // check if need to procedurally generate first
+        if (type == "shell") {
+            generateShell(materialId, transform);
+            continue;
+        } else if (type == "vase") {
+            generateVase(materialId, transform);
+            continue;
+        }
+
         Geom newGeom;
         if (type == "cube")
         {
@@ -90,15 +124,11 @@ void Scene::loadFromJSON(const std::string& jsonName)
         {
             newGeom.type = SPHERE;
         }
-        newGeom.materialid = MatNameToID[p["MATERIAL"]];
-        const auto& trans = p["TRANS"];
-        const auto& rotat = p["ROTAT"];
-        const auto& scale = p["SCALE"];
-        newGeom.translation = glm::vec3(trans[0], trans[1], trans[2]);
-        newGeom.rotation = glm::vec3(rotat[0], rotat[1], rotat[2]);
-        newGeom.scale = glm::vec3(scale[0], scale[1], scale[2]);
-        newGeom.transform = utilityCore::buildTransformationMatrix(
-            newGeom.translation, newGeom.rotation, newGeom.scale);
+        newGeom.materialid = materialId;
+        newGeom.translation = translation;
+        newGeom.rotation = rotation;
+        newGeom.scale = geomScale;
+        newGeom.transform = transform;
         newGeom.inverseTransform = glm::inverse(newGeom.transform);
         newGeom.invTranspose = glm::inverseTranspose(newGeom.transform);
 
@@ -549,4 +579,84 @@ void Scene::initMeshCamera() {
     state.traceDepth = 8;
     state.imageName = "mesh";
     state.image.assign(camera.resolution.x * camera.resolution.y, glm::vec3());
+}
+
+// params for procedural shells
+#define TOTAL_ANGLE 8 * PI
+#define GROWTH_EXP_FACTOR 0.15
+#define CENTER_RADIUS_FACTOR 2
+#define APERTURE_RADIUS_FACTOR 0.5
+#define U_SEGMENTS 96
+#define V_SEGMENTS 24
+
+glm::vec3 Scene::shellPoint(float u, float v) {
+    float growth = expf(GROWTH_EXP_FACTOR * (u - TOTAL_ANGLE));
+    float centerRadius = CENTER_RADIUS_FACTOR * growth;
+    float apertureRadius = APERTURE_RADIUS_FACTOR * growth;
+    float radialDistance = centerRadius + apertureRadius * cosf(v);
+
+    return glm::vec3(
+        radialDistance * cosf(u), growth + 0.8 * apertureRadius * sinf(v), 
+        radialDistance * sinf(u));
+}
+
+glm::vec3 Scene::vasePoint(float u, float v) {
+    float height = 3 * u;
+    float profile = 0.75 + 0.25 * sinf(PI * u);
+    float waves = 1 + 0.15 * sinf(8 * v + 4* PI * u);
+    float radialDistance = profile * waves;
+
+    return glm::vec3(radialDistance * cosf(v), height, radialDistance * sinf(v));
+}
+
+void Scene::addProceduralTriangle(const glm::vec3 &a, const glm::vec3 &b, const glm::vec3 &c, int materialId) {
+    Geom t{};
+    t.type = TRIANGLE;
+    t.materialid = materialId;
+    t.hasNormals = false;
+    t.triangleVertices[0] = a;
+    t.triangleVertices[1] = b;
+    t.triangleVertices[2] = c;
+
+    geoms.push_back(t);
+}
+
+void Scene::generateShell(int materialId, const glm::mat4& transform) {
+    for (int i = 0; i < U_SEGMENTS; ++i) {
+        float u0 = TOTAL_ANGLE * i / U_SEGMENTS;
+        float u1 = TOTAL_ANGLE * (i + 1) / U_SEGMENTS;
+
+        for (int j = 0; j < V_SEGMENTS; ++j) {
+            float v0 = 2 * PI * j / V_SEGMENTS;
+            float v1 = 2 * PI * (j + 1) / V_SEGMENTS;
+
+            glm::vec3 p00 = glm::vec3(transform * glm::vec4(shellPoint(u0, v0), 1.0f));
+            glm::vec3 p01 = glm::vec3(transform * glm::vec4(shellPoint(u0, v1), 1.0f));
+            glm::vec3 p10 = glm::vec3(transform * glm::vec4(shellPoint(u1, v0), 1.0f));
+            glm::vec3 p11 = glm::vec3(transform * glm::vec4(shellPoint(u1, v1), 1.0f));
+
+            addProceduralTriangle(p00, p01, p11, materialId);
+            addProceduralTriangle(p00, p11, p10, materialId);
+        }
+    }
+}
+
+void Scene::generateVase(int materialId, const glm::mat4& transform) {
+    for (int i = 0; i < U_SEGMENTS; ++i) {
+        float u0 = i / U_SEGMENTS;
+        float u1 = (i + 1) / U_SEGMENTS;
+
+        for (int j = 0; j < V_SEGMENTS; ++j) {
+            float v0 = 2 * PI * j / V_SEGMENTS;
+            float v1 = 2 * PI * (j + 1) / V_SEGMENTS;
+
+            glm::vec3 p00 = glm::vec3(transform * glm::vec4(vasePoint(u0, v0), 1.0f));
+            glm::vec3 p01 = glm::vec3(transform * glm::vec4(vasePoint(u0, v1), 1.0f));
+            glm::vec3 p10 = glm::vec3(transform * glm::vec4(vasePoint(u1, v0), 1.0f));
+            glm::vec3 p11 = glm::vec3(transform * glm::vec4(vasePoint(u1, v1), 1.0f));
+
+            addProceduralTriangle(p00, p01, p11, materialId);
+            addProceduralTriangle(p00, p11, p10, materialId);
+        }
+    }
 }

@@ -55,7 +55,7 @@ struct Material
     float hasRefractive;
     float indexOfRefraction;
     float emittance;
-    TextureType TextureType;
+    TextureType textureType;
 };
 
 struct Camera
