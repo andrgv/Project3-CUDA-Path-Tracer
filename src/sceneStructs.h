@@ -78,10 +78,11 @@ struct PathSegment
     glm::vec3 color;
     int pixelIndex;
     int remainingBounces;
-
+    float n; // refractive index
     glm::vec3 L;
     float p_b;
     bool specularBounce;
+
 };
 
 // Use with a corresponding PathSegment to do:

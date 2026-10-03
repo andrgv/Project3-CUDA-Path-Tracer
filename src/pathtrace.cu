@@ -556,6 +556,7 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         segment.L = glm::vec3(0);
         segment.specularBounce = false;
         segment.p_b = 0;
+        segment.n = 1;
 
         // implement antialiasing by jittering the ray
         thrust::default_random_engine rng = makeSeededRandomEngine(iter, index, 0);
@@ -786,23 +787,30 @@ __global__ void shadeMaterial(
             }
             else {
                 #if DIRECT_LIGHTING
-                glm::vec3 Ld = SampleLd(
-                    p, intersection.surfaceNormal, material, geoms,
-                    geoms_size, materials, lightGeomIndices, numLights, rng,
-                    bvhNodes, bvhGeomIndices, bvhNodeCount
-                );
+                if (material.hasRefractive == 0) {
+                    glm::vec3 Ld = SampleLd(
+                        p, intersection.surfaceNormal, material, geoms,
+                        geoms_size, materials, lightGeomIndices, numLights, rng,
+                        bvhNodes, bvhGeomIndices, bvhNodeCount
+                    );
 
-                L += beta * Ld;
+                    L += beta * Ld;
+                }
                 #endif
 
                 scatterRay(path, p, intersection.surfaceNormal, material, rng);
                 path.remainingBounces--;
 
-                float cosTheta = glm::max(
-                    glm::dot(intersection.surfaceNormal, path.ray.direction),
-                    0.0f);
-                path.p_b = cosTheta / PI;
-                path.specularBounce = false;
+                if (material.hasRefractive == 0) {
+                    float cosTheta = glm::max(
+                    glm::dot(intersection.surfaceNormal, path.ray.direction), 0.0f);
+                    path.p_b = cosTheta / PI;
+                    path.specularBounce = false;
+                } else {
+                    path.p_b = 0;
+                    path.specularBounce = true;
+                }
+                
 
                 #if RUSSIAN_ROULETTE
 
