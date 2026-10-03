@@ -37,6 +37,12 @@ struct Geom
     bool hasNormals;
 };
 
+enum TextureType {
+    SOLID,
+    STRIPES,
+    CHECKER
+};
+
 struct Material
 {
     glm::vec3 color;
@@ -49,6 +55,7 @@ struct Material
     float hasRefractive;
     float indexOfRefraction;
     float emittance;
+    TextureType TextureType;
 };
 
 struct Camera
@@ -61,6 +68,8 @@ struct Camera
     glm::vec3 right;
     glm::vec2 fov;
     glm::vec2 pixelLength;
+    float lensRadius;
+    float focalDistance;
 };
 
 struct RenderState

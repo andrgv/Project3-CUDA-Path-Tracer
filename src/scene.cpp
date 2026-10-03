@@ -131,6 +131,9 @@ void Scene::loadFromJSON(const std::string& jsonName)
         2 * yscaled / (float)camera.resolution.y);
 
     camera.view = glm::normalize(camera.lookAt - camera.position);
+    camera.lensRadius = cameraData.value("LENS_RADIUS", 0);
+    camera.focalDistance = cameraData.value(
+        "FOCAL_DISTANCE", glm::length(camera.lookAt - camera.position));
 
     //set up render camera stuff
     int arraylen = camera.resolution.x * camera.resolution.y;
@@ -529,6 +532,9 @@ void Scene::initMeshCamera() {
     camera.up = glm::vec3(0, 1, 0);
     camera.view = glm::normalize(camera.lookAt - camera.position);
     camera.right = glm::normalize(glm::cross(camera.view, camera.up));
+    // default pinhole camera for obj and gltf files
+    camera.lensRadius = 0;
+    camera.focalDistance = glm::length(camera.lookAt - camera.position);
 
     const float yScale = tan(halfFovY);
     const float aspect = (float)(camera.resolution.x) / camera.resolution.y;

@@ -569,6 +569,19 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
             - cam.up * cam.pixelLength.y * ((float)y + jitter_y - (float)cam.resolution.y * 0.5f)
         );
 
+        if (cam.lensRadius > 0) {
+            float radius = cam.lensRadius * sqrtf(u01(rng));
+            float theta = 2 * PI * u01(rng);
+            glm::vec2 pLens(radius * cosf(theta), radius * sinf(theta));
+            
+            float ft = cam.focalDistance / glm::dot(segment.ray.direction, cam.view);
+            glm::vec3 pFocus = cam.position + ft * segment.ray.direction;
+
+            glm::vec3 lensOffset = pLens.x * cam.right + pLens.y * cam.up;
+            segment.ray.origin = cam.position + lensOffset;
+            segment.ray.direction = glm::normalize(pFocus - segment.ray.origin);
+        }
+
         segment.pixelIndex = index;
         segment.remainingBounces = traceDepth;
     }

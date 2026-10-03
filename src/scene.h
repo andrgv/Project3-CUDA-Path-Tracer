@@ -63,8 +63,15 @@ private:
         int texcoord_offset
     );
 
+    // obj/gltf mesh rendering
     void appendMeshToRender();
     void initMeshCamera();
+
+    // procedural shell rendering
+    glm::vec3 shellPoint(float u, float v);
+    void addProceduralTriangle(const glm::vec3& a, const glm::vec3& b, const glm::vec3& c, int materialId);
+    void generateShell(int materialId, const glm::mat4& transform);
+    
 public:
     Scene(std::string filename);
 
