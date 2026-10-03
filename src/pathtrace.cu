@@ -29,7 +29,8 @@
 #define HIERARCHICAL_SPATIAL_DS 1
 #define TEXTURE_MAPPING 1
 #define BUMP_MAPPING 1
-#define ENVIRONMENT_LIGHT 1
+#define ENVIRONMENT_LIGHT 0
+#define HALTON_SEQUENCE 0
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -76,6 +77,19 @@ thrust::default_random_engine makeSeededRandomEngine(int iter, int index, int de
 {
     int h = utilhash((1 << 31) | (depth << 22) | iter) ^ utilhash(index);
     return thrust::default_random_engine(h);
+}
+
+__host__ __device__ float halton(unsigned int index, unsigned int base) {
+    // reverse digits and add decimal point
+    float value = 0.0f;
+    float inverseBase = 1.0f / base;
+    while (index > 0) {
+        value += (index % base) * inverseBase;
+        index /= base;
+        inverseBase /= base;
+    }
+
+    return value;
 }
 
 // helpers for direct lighting
@@ -346,15 +360,19 @@ glm::vec3 SampleLd(
     const glm::vec3& p, const glm::vec3& n, const Material& material,
     Geom* geoms, int geoms_size, Material* materials, int* lightGeomIndices,
     int numLights, thrust::default_random_engine& rng,
-    LinearBVHNode* bvhNodes, int* bvhGeomIndices, int bvhNodeCount
+    LinearBVHNode* bvhNodes, int* bvhGeomIndices, int bvhNodeCount, int iter
 ) {
     if (numLights == 0) {
         return glm::vec3(0);
     }
 
+    #if HALTON_SEQUENCE
+    int lightIndex = (int)(halton(iter, 17) * numLights);
+    #else
     thrust::uniform_real_distribution<float> u01(0, 1);
 
     int lightIndex = (int)(u01(rng) * numLights);
+    #endif
     if (lightIndex == numLights) {
         lightIndex--;
     }
@@ -366,10 +384,17 @@ glm::vec3 SampleLd(
         return glm::vec3(0.0f);
     }
 
+    #if HALTON_SEQUENCE
+    float sqrtU = sqrtf(halton(iter, 11));
+    float b0 = 1.0f - sqrtU;
+    float b1 = halton(iter, 19) * sqrtU;
+    float b2 = 1.0f - b0 - b1;
+    #else
     float sqrtU = sqrtf(u01(rng));
     float b0 = 1.0f - sqrtU;
     float b1 = u01(rng) * sqrtU;
     float b2 = 1.0f - b0 - b1;
+    #endif
 
     glm::vec3 pLight =
         b0 * light.triangleVertices[0] +
@@ -569,10 +594,15 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         segment.n = 1;
 
         // implement antialiasing by jittering the ray
+        #if HALTON_SEQUENCE
+        float jitter_x = halton(iter, 2) - 0.5;
+        float jitter_y = halton(iter, 7) - 0.5;
+        #else
         thrust::default_random_engine rng = makeSeededRandomEngine(iter, index, 0);
         thrust::uniform_real_distribution<float> u01(0, 1);
         float jitter_x = u01(rng) - 0.5;
         float jitter_y = u01(rng) - 0.5;
+        #endif
 
         segment.ray.direction = glm::normalize(cam.view
             - cam.right * cam.pixelLength.x * ((float)x + jitter_x - (float)cam.resolution.x * 0.5f)
@@ -580,8 +610,13 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         );
 
         if (cam.lensRadius > 0) {
+            #if HALTON_SEQUENCE
+            float radius = cam.lensRadius * sqrtf(halton(iter, 3));
+            float theta = 2 * PI * halton(iter, 5);
+            #else
             float radius = cam.lensRadius * sqrtf(u01(rng));
             float theta = 2 * PI * u01(rng);
+            #endif
             glm::vec2 pLens(radius * cosf(theta), radius * sinf(theta));
             
             float ft = cam.focalDistance / glm::dot(segment.ray.direction, cam.view);
@@ -712,8 +747,10 @@ __global__ void shadeFakeMaterial(
           // Set up the RNG
           // LOOK: this is how you use thrust's RNG! Please look at
           // makeSeededRandomEngine as well.
+            #if !HALTON_SEQUENCE
             thrust::default_random_engine rng = makeSeededRandomEngine(iter, idx, 0);
             thrust::uniform_real_distribution<float> u01(0, 1);
+            #endif
 
             Material material = materials[intersection.materialId];
             glm::vec3 materialColor = material.color;
@@ -728,7 +765,11 @@ __global__ void shadeFakeMaterial(
             else {
                 float lightTerm = glm::dot(intersection.surfaceNormal, glm::vec3(0.0f, 1.0f, 0.0f));
                 pathSegments[idx].color *= (materialColor * lightTerm) * 0.3f + ((1.0f - intersection.t * 0.02f) * materialColor) * 0.7f;
+                #if HALTON_SEQUENCE
+                pathSegments[idx].color *= halton(iter, 23);
+                #else
                 pathSegments[idx].color *= u01(rng); // apply some noise because why not
+                #endif
             }
             // If there was no intersection, color the ray black.
             // Lots of renderers use 4 channel color, RGBA, where A = alpha, often
@@ -943,7 +984,7 @@ __global__ void shadeMaterial(
                     glm::vec3 Ld = SampleLd(
                         p, intersection.surfaceNormal, material, geoms,
                         geoms_size, materials, lightGeomIndices, numLights, rng,
-                        bvhNodes, bvhGeomIndices, bvhNodeCount
+                        bvhNodes, bvhGeomIndices, bvhNodeCount, iter
                     );
 
                     L += beta * Ld;
@@ -968,9 +1009,14 @@ __global__ void shadeMaterial(
 
                 float maxBeta = glm::max(beta.x, glm::max(beta.y, beta.z));
                 if (path.remainingBounces > 0 && maxBeta < 1 && depth > 1) {
+                    #if HALTON_SEQUENCE
+                    float rand = halton(iter, 29);
+                    #else
                     thrust::uniform_real_distribution<float> u01(0, 1);
+                    float rand = u01(rng);
+                    #endif
                     float result = glm::max(0.0f, 1.0f - maxBeta);
-                    if (u01(rng) < result) {
+                    if (rand < result) {
                         path.remainingBounces = 0;
                     }
                     else {
