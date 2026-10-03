@@ -17,6 +17,7 @@
 #include "utilities.h"
 #include "intersections.h"
 #include "interactions.h"
+#include "bvh.h"
 
 #define ERRORCHECK 1
 
@@ -25,6 +26,7 @@
 #define DIRECT_LIGHTING 1
 #define MIS 1
 #define RUSSIAN_ROULETTE 1
+#define HIERARCHICAL_SPATIAL_DS 1
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -100,7 +102,202 @@ glm::vec3 TriangleNormal(const Geom& triangle)
 }
 
 __device__
-bool IntersectP(const Ray& ray, float tMax, Geom* geoms, int geoms_size) {
+float IntersectGeom(const Geom& geom, const Ray& ray, glm::vec3& intersectionPoint, glm::vec3& normal){
+    bool outside = true;
+    if (geom.type == CUBE) {
+        return boxIntersectionTest(
+            geom,
+            ray,
+            intersectionPoint,
+            normal,
+            outside
+        );
+    }
+    if (geom.type == SPHERE) {
+        return sphereIntersectionTest(
+            geom,
+            ray,
+            intersectionPoint,
+            normal,
+            outside
+        );
+    }
+    if (geom.type == TRIANGLE) {
+        return triangleIntersectionTest(
+            geom,
+            ray,
+            intersectionPoint,
+            normal,
+            outside
+        );
+    }
+
+    return -1.0f;
+}
+
+__device__
+bool IntersectBounds(
+    const Bounds3& bounds,
+    const Ray& ray,
+    float tMax,
+    const glm::vec3& invDir,
+    const int dirIsNeg[3])
+{
+    float t0 = 0.0f;
+    float t1 = tMax;
+
+    for (int axis = 0; axis < 3; ++axis) {
+        if (ray.direction[axis] == 0.0f) {
+            if (ray.origin[axis] < bounds.pMin[axis] || ray.origin[axis] > bounds.pMax[axis]) {
+                return false;
+            }
+            continue;
+        }
+
+        float nearBound = dirIsNeg[axis] ? bounds.pMax[axis] : bounds.pMin[axis];
+        float farBound = dirIsNeg[axis] ? bounds.pMin[axis] : bounds.pMax[axis];
+
+        float tNear = (nearBound - ray.origin[axis]) * invDir[axis];
+
+        float tFar = (farBound - ray.origin[axis]) * invDir[axis];
+
+        t0 = glm::max(t0, tNear);
+        t1 = glm::min(t1, tFar);
+
+        if (t0 > t1) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+__device__
+void IntersectBVH(
+    const Ray& ray,
+    Geom* geoms,
+    LinearBVHNode* nodes,
+    int* orderedGeomIndices,
+    float& tMin,
+    int& hitGeomIndex,
+    glm::vec3& intersectionPoint,
+    glm::vec3& normal)
+{
+    glm::vec3 invDir = 1.0f / ray.direction;
+    int dirIsNeg[3] = {
+        invDir.x < 0,
+        invDir.y < 0,
+        invDir.z < 0
+    };
+
+    int nodesToVisit[64];
+    int toVisitOffset = 0;
+    int currentNodeIndex = 0;
+
+    while (true) {
+        const LinearBVHNode& node = nodes[currentNodeIndex];
+
+        if (IntersectBounds(node.bounds, ray, tMin, invDir, dirIsNeg)) {
+            if (node.nPrimitives > 0) {
+                for (int i = 0; i < node.nPrimitives; ++i) {
+                    int geomIndex = orderedGeomIndices[node.primitivesOffset + i];
+                    glm::vec3 candidatePoint;
+                    glm::vec3 candidateNormal;
+                    float t = IntersectGeom(geoms[geomIndex], ray, candidatePoint, candidateNormal);
+                    if (t > 0 && t < tMin) {
+                        tMin = t;
+                        hitGeomIndex = geomIndex;
+                        intersectionPoint = candidatePoint;
+                        normal = candidateNormal;
+                    }
+                }
+
+                if (toVisitOffset == 0) {
+                    break;
+                }
+                currentNodeIndex = nodesToVisit[--toVisitOffset];
+            }
+            else {
+                if (dirIsNeg[node.axis]) {
+                    nodesToVisit[toVisitOffset++] = currentNodeIndex + 1;
+                    currentNodeIndex = node.secondChildOffset;
+                } else {
+                    nodesToVisit[toVisitOffset++] = node.secondChildOffset;
+                    currentNodeIndex++;
+                }
+            }
+        } else {
+            if (toVisitOffset == 0) {
+                break;
+            }
+            currentNodeIndex = nodesToVisit[--toVisitOffset];
+        }
+    }
+}
+
+__device__
+bool IntersectP(
+    const Ray& ray,
+    float tMax,
+    Geom* geoms,
+    int geoms_size,
+    LinearBVHNode *nodes,
+    int *orderedGeomIndices,
+    int nodeCount
+) {
+    #if HIERARCHICAL_SPATIAL_DS
+    if (nodeCount == 0) {
+        return false;
+    }
+    if (tMax <= 0) {
+        return false;
+    }
+
+    glm::vec3 invDir = 1.0f / ray.direction;
+    int dirIsNeg[3] = {
+        invDir.x < 0,
+        invDir.y < 0,
+        invDir.z < 0
+    };
+    
+    int nodeToVisit[64];
+    int toVisitOffset = 0;
+    int currNode = 0;
+
+    while (true) {
+        const LinearBVHNode &node = nodes[currNode];
+        if (IntersectBounds(node.bounds, ray, tMax, invDir, dirIsNeg)) {
+            if (node.nPrimitives > 0) {
+                for (int i = 0; i < node.nPrimitives; ++i) {
+                    int geomIndex = orderedGeomIndices[node.primitivesOffset + i];
+                    glm::vec3 intersectionPoint;
+                    glm::vec3 normal;
+                    float t = IntersectGeom(geoms[geomIndex], ray, intersectionPoint, normal);
+                    if (t > 0 && t < tMax) {
+                        return true;
+                    }
+                }
+
+                if (toVisitOffset == 0) {
+                    break;
+                }
+                currNode = nodeToVisit[--toVisitOffset];
+            } else if (dirIsNeg[node.axis]) {
+                nodeToVisit[toVisitOffset++] = currNode + 1;
+                currNode = node.secondChildOffset;
+            } else {
+                nodeToVisit[toVisitOffset++] = node.secondChildOffset;
+                currNode++;
+            }
+        } else {
+            if (toVisitOffset == 0) {
+                break;
+            }
+            currNode = nodeToVisit[--toVisitOffset];
+        }
+    }
+    return false;
+    #else
     for (int i = 0; i < geoms_size; ++i) {
         glm::vec3 intersectionPoint;
         glm::vec3 normal;
@@ -121,6 +318,7 @@ bool IntersectP(const Ray& ray, float tMax, Geom* geoms, int geoms_size) {
     }
 
     return false;
+    #endif
 }
 
 __device__
@@ -144,7 +342,9 @@ __device__
 glm::vec3 SampleLd(
     const glm::vec3& p, const glm::vec3& n, const Material& material,
     Geom* geoms, int geoms_size, Material* materials, int* lightGeomIndices,
-    int numLights, thrust::default_random_engine& rng) {
+    int numLights, thrust::default_random_engine& rng,
+    LinearBVHNode* bvhNodes, int* bvhGeomIndices, int bvhNodeCount
+) {
     if (numLights == 0) {
         return glm::vec3(0);
     }
@@ -189,8 +389,9 @@ glm::vec3 SampleLd(
     float cosTheta = glm::max(glm::dot(n, shadowRay.direction), 0.0f);
     float cosLight = glm::max(glm::dot(TriangleNormal(light), -shadowRay.direction), 0.0f);
 
-    if (cosTheta <= 0 || cosLight <= 0 ||
-        IntersectP(shadowRay, distance, geoms, geoms_size)) {
+    if (cosTheta <= 0 || cosLight <= 0 || 
+        IntersectP(shadowRay, distance, geoms, geoms_size, bvhNodes, bvhGeomIndices, bvhNodeCount)
+    ) {
         return glm::vec3(0);
     }
 
@@ -244,6 +445,12 @@ static ShadeableIntersection* dev_intersections = NULL;
 // TODO: static variables for device memory, any extra info you need, etc
 static int *dev_light_geom_indices = NULL;
 static int num_lights = 0;
+static LinearBVHNode* dev_bvh_nodes = NULL;
+static int* dev_bvh_geom_indices = NULL;
+static int num_bvh_nodes = 0;
+
+static std::vector<LinearBVHNode> hst_bvh_nodes;
+static std::vector<int> hst_bvh_geom_indices;
 
 void InitDataContainer(GuiDataContainer* imGuiData)
 {
@@ -264,6 +471,22 @@ void pathtraceInit(Scene* scene)
 
     cudaMalloc(&dev_geoms, scene->geoms.size() * sizeof(Geom));
     cudaMemcpy(dev_geoms, scene->geoms.data(), scene->geoms.size() * sizeof(Geom), cudaMemcpyHostToDevice);
+
+    #if HIERARCHICAL_SPATIAL_DS
+    if (hst_bvh_nodes.empty()) {
+        BuildBVH(scene->geoms, 4, hst_bvh_nodes, hst_bvh_geom_indices);
+    }
+
+    num_bvh_nodes = hst_bvh_nodes.size();
+    if (num_bvh_nodes > 0) {
+        cudaMalloc(&dev_bvh_nodes, num_bvh_nodes * sizeof(LinearBVHNode));
+        cudaMemcpy(dev_bvh_nodes, hst_bvh_nodes.data(), num_bvh_nodes * sizeof(LinearBVHNode), cudaMemcpyHostToDevice);
+
+        cudaMalloc(&dev_bvh_geom_indices, hst_bvh_geom_indices.size() * sizeof(int));
+        cudaMemcpy(dev_bvh_geom_indices, hst_bvh_geom_indices.data(), hst_bvh_geom_indices.size() * sizeof(int), cudaMemcpyHostToDevice);
+    }
+    #endif
+
 
     cudaMalloc(&dev_materials, scene->materials.size() * sizeof(Material));
     cudaMemcpy(dev_materials, scene->materials.data(), scene->materials.size() * sizeof(Material), cudaMemcpyHostToDevice);
@@ -304,6 +527,8 @@ void pathtraceFree()
     cudaFree(dev_materials);
     cudaFree(dev_intersections);
     cudaFree(dev_light_geom_indices);
+    cudaFree(dev_bvh_geom_indices);
+    cudaFree(dev_bvh_nodes);
     // TODO: clean up any extra device memory you created
 
     checkCUDAError("pathtraceFree");
@@ -358,7 +583,10 @@ __global__ void computeIntersections(
     PathSegment* pathSegments,
     Geom* geoms,
     int geoms_size,
-    ShadeableIntersection* intersections)
+    ShadeableIntersection* intersections,
+    LinearBVHNode* bvhNodes,
+    int* bvhGeomIndices,
+    int bvhNodeCount)
 {
     int path_index = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -378,6 +606,20 @@ __global__ void computeIntersections(
 
         // naive parse through global geoms
 
+        #if HIERARCHICAL_SPATIAL_DS
+        if (bvhNodeCount > 0) {
+            IntersectBVH(
+                pathSegment.ray,
+                geoms,
+                bvhNodes,
+                bvhGeomIndices,
+                t_min,
+                hit_geom_index,
+                intersect_point,
+                normal
+            );
+        }
+        #else
         for (int i = 0; i < geoms_size; i++)
         {
             Geom& geom = geoms[i];
@@ -404,6 +646,7 @@ __global__ void computeIntersections(
                 normal = tmp_normal;
             }
         }
+        #endif
 
         if (hit_geom_index == -1)
         {
@@ -484,7 +727,10 @@ __global__ void shadeMaterial(
     Geom* geoms,
     int geoms_size,
     int* lightGeomIndices,
-    int numLights
+    int numLights,
+    LinearBVHNode* bvhNodes,
+    int* bvhGeomIndices,
+    int bvhNodeCount
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < num_paths)
@@ -542,7 +788,10 @@ __global__ void shadeMaterial(
                 #if DIRECT_LIGHTING
                 glm::vec3 Ld = SampleLd(
                     p, intersection.surfaceNormal, material, geoms,
-                    geoms_size, materials, lightGeomIndices, numLights, rng);
+                    geoms_size, materials, lightGeomIndices, numLights, rng,
+                    bvhNodes, bvhGeomIndices, bvhNodeCount
+                );
+
                 L += beta * Ld;
                 #endif
 
@@ -668,7 +917,10 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_paths,
             dev_geoms,
             hst_scene->geoms.size(),
-            dev_intersections
+            dev_intersections,
+            dev_bvh_nodes,
+            dev_bvh_geom_indices,
+            num_bvh_nodes
         );
         checkCUDAError("trace one bounce");
         cudaDeviceSynchronize();
@@ -699,7 +951,10 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_geoms,
             hst_scene->geoms.size(),
             dev_light_geom_indices,
-            num_lights
+            num_lights,
+            dev_bvh_nodes,
+            dev_bvh_geom_indices,
+            num_bvh_nodes
         );
         checkCUDAError("shade material");
         
